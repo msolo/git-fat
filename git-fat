@@ -122,6 +122,16 @@ def gitconfig_set(name, value, file=None):
     args += [name, value]
     p = subprocess.check_call(args)
 
+def take(n, iterable):
+    "Return first n items of the iterable as a list"
+    items = list(itertools.islice(iterable, n))
+    if len(items) == 0:
+        raise StopIteration
+    if len(items) != n:
+        raise ValueError('insufficient items in iterator')
+    return items
+
+
 class GitFat(object):
     DecodeError = RuntimeError
     def __init__(self):
@@ -165,7 +175,10 @@ class GitFat(object):
         else:
             self.verbose('Pulling from %s' % (remote))
 
-        cmd = ['rsync', '--progress', '--ignore-existing', '--from0', '--files-from=-']
+        cmd = ['rsync',
+               '--progress',
+               '--ignore-existing',
+               '--from0', '--files-from=-']
         rshopts = ''
         if ssh_user:
             rshopts += ' -l ' + ssh_user
@@ -280,6 +293,7 @@ class GitFat(object):
 
     def cmd_filter_smudge(self):
         self.setup()
+        self.verbose('git-fat filter-smudge:  %s %s' % (os.environ, os.getcwd()))
         result, bytes = self.decode_stream(sys.stdin)
         if isinstance(result, str):       # We got a digest
             objfile = os.path.join(self.objdir, result)
@@ -397,6 +411,7 @@ class GitFat(object):
         files = self.referenced_objects(all=pushall) & self.catalog_objects()
         cmd = self.get_rsync_command(push=True)
         self.verbose('Executing: %s' % ' '.join(cmd))
+        self.verbose(' files %ss' % '\n  '.join(files))
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         p.communicate(input='\x00'.join(files))
         if p.returncode:
@@ -436,6 +451,27 @@ class GitFat(object):
         self.verbose('Executing: %s' % ' '.join(cmd))
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         p.communicate(input='\x00'.join(files))
+        if p.returncode:
+            sys.exit(p.returncode)
+        self.checkout()
+
+    def cmd_materialize(self, args):
+        'Materialize a specific file.'
+        self.setup()
+        self.assert_init_done()
+        file_digests = []
+        for arg in args:
+            if arg.startswith('-'):
+                continue
+            if os.path.abspath(arg).startswith(self.gitroot):
+                digest, bytes_len = self.decode_file(arg)
+                if digest:
+                    file_digests.append(digest)
+
+        cmd = self.get_rsync_command(push=False)
+        self.verbose('Executing: %s' % ' '.join(cmd))
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        p.communicate(input='\x00'.join(file_digests))
         if p.returncode:
             sys.exit(p.returncode)
         self.checkout()
@@ -483,6 +519,33 @@ class GitFat(object):
             for obj, data_hash in corrupted_objects:
                 print('%s data hash is %s' % (obj, data_hash))
             sys.exit(1)
+
+    def cmd_pre_receive(self):
+        """Make sure we have all the external block before we accept new refs."""
+        catalog_objects = self.catalog_objects()
+        null_ref = 40 * '0'
+        for line in sys.stdin:
+            old_val, new_val, remote_name = line.strip().split()
+            verbose_stderr('pre-receive', old_val, new_val, remote_name)
+            if new_val != null_ref:
+                verbose_stderr('checking diff-tree %s' % new_val)
+                diff_out = subprocess.check_output(['git', 'diff-tree', '-z', '--no-commit-id', '--name-status', '%s..%s' % (old_val, new_val)])
+                verbose_stderr('checking diff-tree out %r' % diff_out)
+                items = diff_out.decode('utf8').split('\0')[:-1]
+                verbose_stderr('checking diff items %r' % items)
+                item_iter = iter(items)
+                while True:
+                    try:
+                        status, name = take(2, item_iter)
+                        verbose_stderr('checking item %s %s' % (status, name))
+                        if status == 'D':
+                            continue
+                        new_blob = subprocess.check_output(['git', 'show', '%s:%s' % (new_val, name)])
+                        digest, _ = self.decode(new_blob, noraise=True)
+                        if digest and digest not in catalog_objects:
+                            sys.exit('Unpushed fat file ref %s, run: git fat push' % digest)
+                    except StopIteration:
+                        break
 
     def cmd_init(self):
         self.setup()
@@ -607,6 +670,8 @@ if __name__ == '__main__':
         fat.cmd_push(sys.argv[2:])
     elif cmd == 'pull':
         fat.cmd_pull(sys.argv[2:])
+    elif cmd == 'materialize':
+        fat.cmd_materialize(sys.argv[2:])
     elif cmd == 'gc':
         fat.cmd_gc()
     elif cmd == 'verify':
@@ -617,5 +682,7 @@ if __name__ == '__main__':
         fat.cmd_find(sys.argv[2:])
     elif cmd == 'index-filter':
         fat.cmd_index_filter(sys.argv[2:])
+    elif cmd == 'pre-receive':
+        fat.cmd_pre_receive()
     else:
         print('Usage: git fat [init|status|push|pull|gc|verify|checkout|find|index-filter]', file=sys.stderr)
